@@ -11,6 +11,7 @@ A Python Telegram bot foundation for cargo workflows, built incrementally as the
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required environment: `TELEGRAM_BOT_TOKEN` and `CUSTOMER_DATA_ENCRYPTION_KEY` in Replit Secrets, plus the managed PostgreSQL `DATABASE_URL`
+- Admin access: `TELEGRAM_ADMIN_IDS` is a comma-separated allowlist of Telegram user IDs; an empty list denies all admin commands
 
 ## Stack
 
@@ -24,19 +25,21 @@ A Python Telegram bot foundation for cargo workflows, built incrementally as the
 
 ## Where things live
 
-- `src/cargo_bot/` — Telegram bot configuration, startup, and database connectivity check
-- `lib/db/` — shared PostgreSQL schema for the TypeScript API
+- `src/cargo_bot/` — Telegram registration and admin commands, encryption, configuration, and database access
+- `lib/db/` — shared PostgreSQL schema for customer registrations and tracking-code audit records
 - `artifacts/api-server/` — shared Express API
 
 ## Architecture decisions
 
 - Telegram's official Bot API is called directly from Python; no Telegram Replit integration is configured.
-- Customer phone, passport number, and passport photo are encrypted with AES-GCM before being stored in PostgreSQL; the Telegram user lookup key is HMAC-derived.
+- Customer phone, passport number, passport photo, and Telegram ID are encrypted with AES-GCM before being stored in PostgreSQL; Telegram and phone lookup keys are HMAC-derived.
+- Tracking codes are allocated transactionally from `UZ10001`, protected by database uniqueness constraints, and every assignment or change is recorded in an audit table.
+- Admin search, code changes, and history are private-chat-only and require a Telegram user ID in `TELEGRAM_ADMIN_IDS`; code changes notify the customer after the database commit.
 - The bot uses the managed PostgreSQL connection as provided by Replit and does not override its connection-security settings.
 
 ## Product
 
-The bot supports private customer registration: it collects the customer's own Telegram contact, validates the passport number format, accepts a JPEG/PNG passport image, and stores the submitted data encrypted in PostgreSQL. No other cargo features are included.
+The bot supports private customer registration and admin-only customer tracking-code management. It collects the customer's own Telegram contact, validates the passport number format, accepts a JPEG/PNG passport image, and stores the submitted data encrypted in PostgreSQL. No other cargo features are included.
 
 ## User preferences
 

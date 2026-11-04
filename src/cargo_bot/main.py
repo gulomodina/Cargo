@@ -21,8 +21,13 @@ from telegram.ext import (
     filters,
 )
 
+from .admin import change_tracking_code, search_customers, show_tracking_code_history
 from .config import Settings
-from .crypto import encrypt_customer_registration
+from .crypto import (
+    customer_phone_lookup_key,
+    encrypt_customer_registration,
+    normalize_phone_number,
+)
 from .database import save_customer_registration, verify_database_connection
 
 logger = logging.getLogger(__name__)
@@ -132,9 +137,15 @@ async def receive_phone(
         )
         return WAITING_FOR_PHONE
 
-    context.user_data["customer_registration"] = {
-        "phone_number": contact.phone_number.strip(),
-    }
+    try:
+        phone_number = normalize_phone_number(contact.phone_number)
+    except ValueError:
+        await message.reply_text(
+            "That phone number is invalid. Please share your number using the button."
+        )
+        return WAITING_FOR_PHONE
+
+    context.user_data["customer_registration"] = {"phone_number": phone_number}
     await message.reply_text(
         "Enter your passport series and number, for example AB1234567.",
         reply_markup=ReplyKeyboardRemove(),
@@ -256,10 +267,15 @@ async def receive_photo(
             photo=image,
             photo_mime_type=mime_type,
         )
-        await save_customer_registration(
+        phone_lookup = customer_phone_lookup_key(
+            settings.customer_data_encryption_key,
+            registration["phone_number"],
+        )
+        tracking_code = await save_customer_registration(
             settings.database_url,
             user_key,
             encrypted_payload,
+            phone_lookup,
         )
     except Exception as error:
         logger.error("Customer registration failed (%s).", type(error).__name__)
@@ -272,7 +288,8 @@ async def receive_photo(
 
     context.user_data.clear()
     await message.reply_text(
-        "Your customer registration is complete. Your information was saved encrypted.",
+        f"Your customer registration is complete. Your tracking code is "
+        f"{tracking_code}. Your information was saved encrypted.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
@@ -316,6 +333,24 @@ def main() -> None:
         context: ContextTypes.DEFAULT_TYPE,
     ) -> int:
         return await receive_photo(update, context, settings)
+
+    async def handle_admin_search(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        await search_customers(update, context, settings)
+
+    async def handle_admin_code_change(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        await change_tracking_code(update, context, settings)
+
+    async def handle_admin_code_history(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        await show_tracking_code_history(update, context, settings)
 
     application = (
         Application.builder()
@@ -363,5 +398,12 @@ def main() -> None:
         per_user=True,
     )
     application.add_handler(registration_conversation)
+    application.add_handler(CommandHandler("customer_search", handle_admin_search))
+    application.add_handler(
+        CommandHandler("customer_set_code", handle_admin_code_change)
+    )
+    application.add_handler(
+        CommandHandler("customer_code_history", handle_admin_code_history)
+    )
     application.add_error_handler(report_update_error)
     application.run_polling()

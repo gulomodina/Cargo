@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import json
 import os
+import re
 import secrets
 import struct
 import unittest
@@ -9,17 +11,28 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import psycopg
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from psycopg.conninfo import make_conninfo
 from telegram.constants import ChatType
 from telegram.ext import ConversationHandler
 
-from cargo_bot import main
+from cargo_bot import admin, main
 from cargo_bot.config import Settings
-from cargo_bot.crypto import _derive_key, encrypt_customer_registration
+from cargo_bot.crypto import (
+    customer_phone_lookup_key,
+    decrypt_customer_registration,
+    encrypt_customer_registration,
+)
+from cargo_bot.database import (
+    find_customer_by_tracking_code,
+    get_customer_tracking_code_history,
+    save_customer_registration,
+)
 
 
 FAKE_PHONE_NUMBER = "+15555550123"
+FAKE_NORMALIZED_PHONE = "15555550123"
 FAKE_PASSPORT_NUMBER = "AB1234567"
+FAKE_ADMIN_ID = 987654321
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -39,7 +52,7 @@ def _fake_png() -> bytes:
     )
 
 
-class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
+class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         database_url = os.environ.get("DATABASE_URL", "")
@@ -49,72 +62,168 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
                 "Development database and encryption key are required."
             )
 
+        cls.schema_name = f"test_customer_{secrets.token_hex(8)}"
+        if re.fullmatch(r"test_customer_[a-f0-9]{16}", cls.schema_name) is None:
+            raise RuntimeError("Temporary test schema name is invalid.")
+        cls.original_database_url = database_url
+        cls.test_database_url = make_conninfo(
+            database_url,
+            options=f"-c search_path={cls.schema_name}",
+        )
         cls.settings = Settings(
             telegram_bot_token="test-token-not-used",
-            database_url=database_url,
+            database_url=cls.test_database_url,
             customer_data_encryption_key=base64.b64decode(
                 key_text,
                 altchars=b"-_",
                 validate=True,
             ),
+            telegram_admin_ids=frozenset({FAKE_ADMIN_ID}),
         )
+        asyncio.run(cls._create_isolated_test_schema())
+
+    @classmethod
+    async def _create_isolated_test_schema(cls) -> None:
+        async with await psycopg.AsyncConnection.connect(
+            cls.original_database_url,
+            connect_timeout=5,
+        ) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(f'CREATE SCHEMA "{cls.schema_name}"')
+
+        statements = (
+            """
+            CREATE TABLE customer_registrations (
+                user_key BYTEA PRIMARY KEY,
+                encrypted_payload BYTEA NOT NULL,
+                tracking_code VARCHAR(32) UNIQUE,
+                phone_lookup_key BYTEA,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX customer_registrations_phone_lookup_idx
+            ON customer_registrations(phone_lookup_key)
+            """,
+            """
+            CREATE TABLE customer_tracking_code_counters (
+                id INTEGER PRIMARY KEY,
+                last_number BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE customer_tracking_code_audit (
+                id BIGSERIAL PRIMARY KEY,
+                user_key BYTEA NOT NULL REFERENCES customer_registrations(user_key)
+                    ON DELETE CASCADE,
+                old_tracking_code VARCHAR(32),
+                new_tracking_code VARCHAR(32) NOT NULL UNIQUE,
+                changed_by_telegram_id BIGINT,
+                actor_type VARCHAR(16) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+        )
+        async with await psycopg.AsyncConnection.connect(
+            cls.test_database_url,
+            connect_timeout=5,
+        ) as connection:
+            async with connection.cursor() as cursor:
+                for statement in statements:
+                    await cursor.execute(statement)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if not hasattr(cls, "schema_name"):
+            return
+        asyncio.run(cls._drop_isolated_test_schema())
+
+    @classmethod
+    async def _drop_isolated_test_schema(cls) -> None:
+        async with await psycopg.AsyncConnection.connect(
+            cls.original_database_url,
+            connect_timeout=5,
+        ) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(f'DROP SCHEMA "{cls.schema_name}" CASCADE')
 
     async def asyncSetUp(self) -> None:
-        self.photo = _fake_png()
-        self.telegram_user_id = 0
-        self.user_key = b""
-
         async with await psycopg.AsyncConnection.connect(
             self.settings.database_url,
             connect_timeout=5,
         ) as connection:
             async with connection.cursor() as cursor:
-                while True:
-                    self.telegram_user_id = (
-                        1_000_000_000_000_000_000 + secrets.randbelow(900_000_000_000_000_000)
-                    )
-                    self.user_key, _ = encrypt_customer_registration(
-                        master_key=self.settings.customer_data_encryption_key,
-                        telegram_user_id=self.telegram_user_id,
-                        phone_number=FAKE_PHONE_NUMBER,
-                        passport_number=FAKE_PASSPORT_NUMBER,
-                        photo=self.photo,
-                        photo_mime_type="image/png",
-                    )
-                    await cursor.execute(
-                        "SELECT 1 FROM customer_registrations WHERE user_key = %s",
-                        (self.user_key,),
-                    )
-                    if await cursor.fetchone() is None:
-                        break
+                await cursor.execute(
+                    """
+                    TRUNCATE TABLE customer_tracking_code_audit,
+                                   customer_registrations,
+                                   customer_tracking_code_counters
+                    RESTART IDENTITY CASCADE
+                    """
+                )
 
+        self.photo = _fake_png()
+        self.telegram_user_id = self._fake_telegram_id()
         self.context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
 
     async def asyncTearDown(self) -> None:
-        if not self.user_key:
-            return
         async with await psycopg.AsyncConnection.connect(
             self.settings.database_url,
             connect_timeout=5,
         ) as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
-                    "DELETE FROM customer_registrations WHERE user_key = %s",
-                    (self.user_key,),
+                    """
+                    TRUNCATE TABLE customer_tracking_code_audit,
+                                   customer_registrations,
+                                   customer_tracking_code_counters
+                    RESTART IDENTITY CASCADE
+                    """
                 )
                 await cursor.execute(
-                    "SELECT 1 FROM customer_registrations WHERE user_key = %s",
-                    (self.user_key,),
+                    "SELECT COUNT(*) FROM customer_registrations"
                 )
-                self.assertIsNone(await cursor.fetchone())
+                row = await cursor.fetchone()
+        self.assertEqual(row[0], 0)
 
-    async def test_complete_registration_saves_only_encrypted_data(self) -> None:
+    @staticmethod
+    def _fake_telegram_id() -> int:
+        return 1_000_000_000_000_000_000 + secrets.randbelow(
+            900_000_000_000_000_000
+        )
+
+    async def _save_fake_customer(
+        self,
+        telegram_user_id: int,
+        phone_number: str = FAKE_PHONE_NUMBER,
+    ) -> tuple[bytes, str]:
+        user_key, encrypted_payload = encrypt_customer_registration(
+            master_key=self.settings.customer_data_encryption_key,
+            telegram_user_id=telegram_user_id,
+            phone_number=phone_number,
+            passport_number=FAKE_PASSPORT_NUMBER,
+            photo=self.photo,
+            photo_mime_type="image/png",
+        )
+        phone_lookup = customer_phone_lookup_key(
+            self.settings.customer_data_encryption_key,
+            phone_number,
+        )
+        tracking_code = await save_customer_registration(
+            self.settings.database_url,
+            user_key,
+            encrypted_payload,
+            phone_lookup,
+        )
+        return user_key, tracking_code
+
+    async def test_registration_assigns_code_and_stores_encrypted_data(self) -> None:
         chat = SimpleNamespace(type=ChatType.PRIVATE)
 
         start_message = SimpleNamespace(reply_text=AsyncMock())
         start_update = SimpleNamespace(effective_message=start_message, effective_chat=chat)
         state = await main.start(start_update, self.context)
-
         self.assertEqual(state, ConversationHandler.END)
         registration_button = (
             start_message.reply_text.await_args.kwargs["reply_markup"]
@@ -135,7 +244,6 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
             effective_chat=chat,
         )
         state = await main.begin_registration(callback_update, self.context)
-
         self.assertEqual(state, main.WAITING_FOR_PHONE)
         contact_button = (
             registration_message.reply_text.await_args.kwargs["reply_markup"]
@@ -155,7 +263,6 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
             effective_user=SimpleNamespace(id=self.telegram_user_id),
         )
         state = await main.receive_phone(unowned_contact_update, self.context)
-
         self.assertEqual(state, main.WAITING_FOR_PHONE)
         self.assertNotIn("customer_registration", self.context.user_data)
 
@@ -171,11 +278,10 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
             effective_user=SimpleNamespace(id=self.telegram_user_id),
         )
         state = await main.receive_phone(phone_update, self.context)
-
         self.assertEqual(state, main.WAITING_FOR_PASSPORT)
-        self.assertTrue(
-            self.context.user_data["customer_registration"]["phone_number"]
-            == FAKE_PHONE_NUMBER
+        self.assertEqual(
+            self.context.user_data["customer_registration"]["phone_number"],
+            FAKE_NORMALIZED_PHONE,
         )
 
         invalid_passport_message = SimpleNamespace(
@@ -186,7 +292,6 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
             effective_message=invalid_passport_message,
         )
         state = await main.receive_passport(invalid_passport_update, self.context)
-
         self.assertEqual(state, main.WAITING_FOR_PASSPORT)
         self.assertNotIn(
             "passport_number",
@@ -199,12 +304,7 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
         )
         passport_update = SimpleNamespace(effective_message=passport_message)
         state = await main.receive_passport(passport_update, self.context)
-
         self.assertEqual(state, main.WAITING_FOR_PHOTO)
-        self.assertTrue(
-            self.context.user_data["customer_registration"]["passport_number"]
-            == FAKE_PASSPORT_NUMBER
-        )
 
         remote_file = SimpleNamespace(
             download_as_bytearray=AsyncMock(return_value=bytearray(self.photo))
@@ -229,9 +329,61 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, ConversationHandler.END)
         success_message = photo_message.reply_text.await_args.args[0]
         self.assertIn("registration is complete", success_message)
-        self.assertEqual(self.context.user_data, {})
+        self.assertIn("UZ10001", success_message)
         self.context.bot.get_file.assert_awaited_once()
+        self.assertEqual(self.context.user_data, {})
 
+        user_key, encrypted_payload = await self._saved_payload()
+        self.assertNotIn(FAKE_NORMALIZED_PHONE.encode(), encrypted_payload)
+        self.assertNotIn(FAKE_PASSPORT_NUMBER.encode(), encrypted_payload)
+        self.assertNotIn(self.photo, encrypted_payload)
+        saved_registration = decrypt_customer_registration(
+            self.settings.customer_data_encryption_key,
+            user_key,
+            encrypted_payload,
+        )
+        self.assertTrue(
+            saved_registration.get("phone_number") == FAKE_NORMALIZED_PHONE
+        )
+        self.assertTrue(
+            saved_registration.get("passport_number") == FAKE_PASSPORT_NUMBER
+        )
+        self.assertEqual(saved_registration.get("telegram_user_id"), self.telegram_user_id)
+        self.assertEqual(saved_registration.get("passport_photo_mime_type"), "image/png")
+        self.assertEqual(
+            base64.b64decode(saved_registration["passport_photo"]),
+            self.photo,
+        )
+
+        record = await find_customer_by_tracking_code(
+            self.settings.database_url,
+            "UZ10001",
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(
+            record.phone_lookup_key,
+            customer_phone_lookup_key(
+                self.settings.customer_data_encryption_key,
+                FAKE_PHONE_NUMBER,
+            ),
+        )
+        history = await get_customer_tracking_code_history(
+            self.settings.database_url,
+            "UZ10001",
+        )
+        self.assertEqual(len(history), 1)
+        self.assertIsNone(history[0].old_tracking_code)
+        self.assertEqual(history[0].actor_type, "registration")
+
+        _, repeated_code = await self._save_fake_customer(self.telegram_user_id)
+        self.assertEqual(repeated_code, "UZ10001")
+        history = await get_customer_tracking_code_history(
+            self.settings.database_url,
+            "UZ10001",
+        )
+        self.assertEqual(len(history), 1)
+
+    async def _saved_payload(self) -> tuple[bytes, bytes]:
         async with await psycopg.AsyncConnection.connect(
             self.settings.database_url,
             connect_timeout=5,
@@ -239,42 +391,172 @@ class CustomerRegistrationFlowTest(unittest.IsolatedAsyncioTestCase):
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     """
-                    SELECT encrypted_payload
+                    SELECT user_key, encrypted_payload
                     FROM customer_registrations
-                    WHERE user_key = %s
-                    """,
-                    (self.user_key,),
+                    """
                 )
                 row = await cursor.fetchone()
-
         self.assertIsNotNone(row)
-        encrypted_payload = bytes(row[0])
-        self.assertGreater(len(encrypted_payload), 12)
-        self.assertNotIn(FAKE_PHONE_NUMBER.encode(), encrypted_payload)
-        self.assertNotIn(FAKE_PASSPORT_NUMBER.encode(), encrypted_payload)
-        self.assertNotIn(self.photo, encrypted_payload)
+        return bytes(row[0]), bytes(row[1])
 
-        encryption_key = _derive_key(
-            self.settings.customer_data_encryption_key,
-            b"customer-record-v1",
+    async def test_admin_search_change_history_and_duplicate_protection(self) -> None:
+        first_customer_id = self._fake_telegram_id()
+        second_customer_id = self._fake_telegram_id()
+        _, first_code = await self._save_fake_customer(first_customer_id)
+        _, second_code = await self._save_fake_customer(
+            second_customer_id,
+            phone_number="+15555550124",
         )
-        decrypted_payload = AESGCM(encryption_key).decrypt(
-            encrypted_payload[:12],
-            encrypted_payload[12:],
-            self.user_key,
+        self.assertEqual(first_code, "UZ10001")
+        self.assertEqual(second_code, "UZ10002")
+
+        admin_message = SimpleNamespace(reply_text=AsyncMock())
+        authorized_update = SimpleNamespace(
+            effective_message=admin_message,
+            effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_user=SimpleNamespace(id=FAKE_ADMIN_ID),
         )
-        saved_registration = json.loads(decrypted_payload)
-        self.assertTrue(
-            saved_registration.get("phone_number") == FAKE_PHONE_NUMBER
+        search_context = SimpleNamespace(args=[FAKE_PHONE_NUMBER])
+        await admin.search_customers(
+            authorized_update,
+            search_context,
+            self.settings,
         )
-        self.assertTrue(
-            saved_registration.get("passport_number") == FAKE_PASSPORT_NUMBER
+        search_response = admin_message.reply_text.await_args.args[0]
+        self.assertIn(first_code, search_response)
+        self.assertNotIn(FAKE_PHONE_NUMBER, search_response)
+        self.assertNotIn(FAKE_PASSPORT_NUMBER, search_response)
+
+        search_by_code_message = SimpleNamespace(reply_text=AsyncMock())
+        search_by_code_update = SimpleNamespace(
+            effective_message=search_by_code_message,
+            effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_user=SimpleNamespace(id=FAKE_ADMIN_ID),
         )
-        self.assertEqual(saved_registration.get("passport_photo_mime_type"), "image/png")
+        await admin.search_customers(
+            search_by_code_update,
+            SimpleNamespace(args=[second_code]),
+            self.settings,
+        )
+        self.assertIn(second_code, search_by_code_message.reply_text.await_args.args[0])
+
+        unauthorized_message = SimpleNamespace(reply_text=AsyncMock())
+        unauthorized_update = SimpleNamespace(
+            effective_message=unauthorized_message,
+            effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_user=SimpleNamespace(id=FAKE_ADMIN_ID + 1),
+        )
+        await admin.change_tracking_code(
+            unauthorized_update,
+            SimpleNamespace(args=[first_code, "UZ50000"]),
+            self.settings,
+        )
+        self.assertIn(
+            "restricted to authorized admins",
+            unauthorized_message.reply_text.await_args.args[0],
+        )
+
+        notification_bot = SimpleNamespace(send_message=AsyncMock())
+        change_admin_message = SimpleNamespace(reply_text=AsyncMock())
+        change_admin_update = SimpleNamespace(
+            effective_message=change_admin_message,
+            effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_user=SimpleNamespace(id=FAKE_ADMIN_ID),
+        )
+        first_notification_bot = SimpleNamespace(send_message=AsyncMock())
+        await admin.change_tracking_code(
+            change_admin_update,
+            SimpleNamespace(
+                args=[first_code, "UZ50000"],
+                bot=first_notification_bot,
+            ),
+            self.settings,
+        )
+        self.assertIn(
+            "customer was notified",
+            change_admin_message.reply_text.await_args.args[0],
+        )
+        first_notification_bot.send_message.assert_awaited_once()
         self.assertEqual(
-            base64.b64decode(saved_registration["passport_photo"]),
-            self.photo,
+            first_notification_bot.send_message.await_args.kwargs["chat_id"],
+            first_customer_id,
         )
+
+        notification_context = SimpleNamespace(
+            args=[second_code, "UZ60000"],
+            bot=notification_bot,
+        )
+        # The first customer already changed to UZ50000; set the second customer code.
+        await admin.change_tracking_code(
+            change_admin_update,
+            notification_context,
+            self.settings,
+        )
+        notification_bot.send_message.assert_awaited_once()
+        self.assertEqual(
+            notification_bot.send_message.await_args.kwargs["chat_id"],
+            second_customer_id,
+        )
+        self.assertIn(
+            "UZ60000",
+            notification_bot.send_message.await_args.kwargs["text"],
+        )
+        self.assertNotIn(
+            FAKE_PASSPORT_NUMBER,
+            notification_bot.send_message.await_args.kwargs["text"],
+        )
+
+        duplicate_admin_message = SimpleNamespace(reply_text=AsyncMock())
+        duplicate_admin_update = SimpleNamespace(
+            effective_message=duplicate_admin_message,
+            effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_user=SimpleNamespace(id=FAKE_ADMIN_ID),
+        )
+        await admin.change_tracking_code(
+            duplicate_admin_update,
+            SimpleNamespace(args=["UZ50000", "UZ60000"]),
+            self.settings,
+        )
+        self.assertIn(
+            "already assigned or was used before",
+            duplicate_admin_message.reply_text.await_args.args[0],
+        )
+        self.assertEqual(
+            (await find_customer_by_tracking_code(
+                self.settings.database_url,
+                "UZ50000",
+            )).tracking_code,
+            "UZ50000",
+        )
+
+        history_message = SimpleNamespace(reply_text=AsyncMock())
+        history_update = SimpleNamespace(
+            effective_message=history_message,
+            effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_user=SimpleNamespace(id=FAKE_ADMIN_ID),
+        )
+        await admin.show_tracking_code_history(
+            history_update,
+            SimpleNamespace(args=["UZ50000"]),
+            self.settings,
+        )
+        history_response = history_message.reply_text.await_args.args[0]
+        self.assertIn("new registration", history_response)
+        self.assertIn("UZ50000", history_response)
+        self.assertIn("admin", history_response)
+
+        next_customer_id = self._fake_telegram_id()
+        _, next_code = await self._save_fake_customer(next_customer_id)
+        self.assertEqual(next_code, "UZ60001")
+
+    async def test_concurrent_registrations_receive_distinct_codes(self) -> None:
+        user_ids = [self._fake_telegram_id() for _ in range(8)]
+        saved = await asyncio.gather(
+            *(self._save_fake_customer(user_id) for user_id in user_ids)
+        )
+        codes = [tracking_code for _, tracking_code in saved]
+        self.assertEqual(len(codes), len(set(codes)))
+        self.assertEqual(set(codes), {f"UZ{number:05d}" for number in range(10001, 10009)})
 
 
 if __name__ == "__main__":

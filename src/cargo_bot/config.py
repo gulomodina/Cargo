@@ -9,6 +9,7 @@ class Settings:
     telegram_bot_token: str
     database_url: str
     customer_data_encryption_key: bytes
+    telegram_admin_ids: frozenset[int] = frozenset()
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -40,8 +41,20 @@ class Settings:
                 "CUSTOMER_DATA_ENCRYPTION_KEY must decode to 16, 24, or 32 random bytes."
             )
 
+        admin_ids: set[int] = set()
+        for value in os.environ.get("TELEGRAM_ADMIN_IDS", "").split(","):
+            value = value.strip()
+            if not value:
+                continue
+            if not value.isascii() or not value.isdigit() or int(value) <= 0:
+                raise RuntimeError(
+                    "TELEGRAM_ADMIN_IDS must be comma-separated positive Telegram user IDs."
+                )
+            admin_ids.add(int(value))
+
         return cls(
             telegram_bot_token=values["TELEGRAM_BOT_TOKEN"],
             database_url=values["DATABASE_URL"],
             customer_data_encryption_key=encryption_key,
+            telegram_admin_ids=frozenset(admin_ids),
         )

@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 
 from cryptography.hazmat.primitives import hashes
@@ -16,6 +17,29 @@ def _derive_key(master_key: bytes, purpose: bytes) -> bytes:
         salt=None,
         info=b"telegram-cargo-bot/" + purpose,
     ).derive(master_key)
+
+
+def normalize_phone_number(phone_number: str) -> str:
+    compact = re.sub(r"[\s().-]", "", phone_number.strip())
+    if compact.startswith("+"):
+        compact = compact[1:]
+    if (
+        not compact.isascii()
+        or not compact.isdigit()
+        or not 7 <= len(compact) <= 15
+    ):
+        raise ValueError("Phone number must contain 7 to 15 digits.")
+    return compact
+
+
+def customer_phone_lookup_key(master_key: bytes, phone_number: str) -> bytes:
+    lookup_key = _derive_key(master_key, b"customer-phone-lookup-v1")
+    normalized_phone = normalize_phone_number(phone_number)
+    return hmac.new(
+        lookup_key,
+        normalized_phone.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
 
 
 def encrypt_customer_registration(
@@ -36,10 +60,11 @@ def encrypt_customer_registration(
 
     payload = json.dumps(
         {
-            "phone_number": phone_number,
+            "phone_number": normalize_phone_number(phone_number),
             "passport_number": passport_number,
             "passport_photo": base64.b64encode(photo).decode("ascii"),
             "passport_photo_mime_type": photo_mime_type,
+            "telegram_user_id": telegram_user_id,
         },
         separators=(",", ":"),
         ensure_ascii=True,
@@ -53,3 +78,20 @@ def encrypt_customer_registration(
         user_key,
     )
     return user_key, encrypted_payload
+
+
+def decrypt_customer_registration(
+    master_key: bytes,
+    user_key: bytes,
+    encrypted_payload: bytes,
+) -> dict[str, object]:
+    encryption_key = _derive_key(master_key, b"customer-record-v1")
+    plaintext = AESGCM(encryption_key).decrypt(
+        encrypted_payload[:12],
+        encrypted_payload[12:],
+        user_key,
+    )
+    registration = json.loads(plaintext)
+    if not isinstance(registration, dict):
+        raise ValueError("Encrypted customer registration is invalid.")
+    return registration
