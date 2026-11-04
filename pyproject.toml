@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A Telegram cargo management bot, built incrementally."
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=50.0.2",
     "psycopg[binary]>=3.3.7",
     "python-telegram-bot>=22.8",
 ]

@@ -10,7 +10,7 @@ A Python Telegram bot foundation for cargo workflows, built incrementally as the
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required environment: `TELEGRAM_BOT_TOKEN` in Replit Secrets and the managed PostgreSQL `DATABASE_URL`
+- Required environment: `TELEGRAM_BOT_TOKEN` and `CUSTOMER_DATA_ENCRYPTION_KEY` in Replit Secrets, plus the managed PostgreSQL `DATABASE_URL`
 
 ## Stack
 
@@ -31,11 +31,12 @@ A Python Telegram bot foundation for cargo workflows, built incrementally as the
 ## Architecture decisions
 
 - Telegram's official Bot API is called directly from Python; no Telegram Replit integration is configured.
-- The bot uses the managed PostgreSQL connection as provided by Replit; it does not override platform connection-security settings or create tables until a cargo feature needs them.
+- Customer phone, passport number, and passport photo are encrypted with AES-GCM before being stored in PostgreSQL; the Telegram user lookup key is HMAC-derived.
+- The bot uses the managed PostgreSQL connection as provided by Replit and does not override its connection-security settings.
 
 ## Product
 
-The current bot foundation validates required environment variables, checks the database connection at startup, and responds to `/start`. Cargo management features are intentionally not included yet.
+The bot supports private customer registration: it collects the customer's own Telegram contact, validates the passport number format, accepts a JPEG/PNG passport image, and stores the submitted data encrypted in PostgreSQL. No other cargo features are included.
 
 ## User preferences
 
@@ -44,6 +45,7 @@ The current bot foundation validates required environment variables, checks the 
 ## Gotchas
 
 - Never print the Telegram token or database connection string in logs.
+- Never log contact details, passport numbers, passport images, or encryption keys. Losing `CUSTOMER_DATA_ENCRYPTION_KEY` makes stored registrations unreadable.
 
 ## Pointers
 

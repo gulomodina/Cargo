@@ -1,3 +1,5 @@
+export * from "./customer-registrations";
+
 // Export your models here. Add one export per file
 // export * from "./posts";
 //
