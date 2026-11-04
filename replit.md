@@ -1,18 +1,20 @@
-# [Project name]
+# Telegram Cargo Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A Python Telegram bot foundation for cargo workflows, built incrementally as the user requests each feature.
 
 ## Run & Operate
 
+- `uv run python -m cargo_bot` — run the Telegram bot
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required environment: `TELEGRAM_BOT_TOKEN` in Replit Secrets and the managed PostgreSQL `DATABASE_URL`
 
 ## Stack
 
+- Python 3.11, `python-telegram-bot`, psycopg 3
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5
 - DB: PostgreSQL + Drizzle ORM
@@ -22,23 +24,26 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `src/cargo_bot/` — Telegram bot configuration, startup, and database connectivity check
+- `lib/db/` — shared PostgreSQL schema for the TypeScript API
+- `artifacts/api-server/` — shared Express API
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Telegram's official Bot API is called directly from Python; no Telegram Replit integration is configured.
+- The bot uses the managed PostgreSQL connection as provided by Replit; it does not override platform connection-security settings or create tables until a cargo feature needs them.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+The current bot foundation validates required environment variables, checks the database connection at startup, and responds to `/start`. Cargo management features are intentionally not included yet.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Build the bot step by step; do not add features until the user instructs you to.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Never print the Telegram token or database connection string in logs.
 
 ## Pointers
 

@@ -1,0 +1,16 @@
+[project]
+name = "cargo-bot"
+version = "0.1.0"
+description = "A Telegram cargo management bot, built incrementally."
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.3.7",
+    "python-telegram-bot>=22.8",
+]
+
+[project.scripts]
+telegram-cargo-bot = "cargo_bot.main:main"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
