@@ -357,6 +357,7 @@ def main() -> None:
                 ),
             ],
         },
+        fallbacks=[],
         allow_reentry=True,
         per_chat=True,
         per_user=True,
