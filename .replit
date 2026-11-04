@@ -42,3 +42,8 @@ timeoutMs = 20000
 [nix]
 channel = "stable-25_05"
 packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "postgresql", "rustc"]
+
+[userenv]
+
+[userenv.shared]
+TELEGRAM_ADMIN_IDS = "9006775146"
