@@ -19,6 +19,23 @@ TEXTS: dict[Language, dict[str, str]] = {
             "Ro‘yxatdan o‘tish uchun telefon raqamingiz, pasport raqamingiz va "
             "pasportingizning surati so‘raladi. Ma’lumotlar saqlanishidan oldin shifrlanadi."
         ),
+        "consent_notice": (
+            "AGLINK CARGO ro‘yxatdan o‘tishi uchun telefon raqamingiz, pasport "
+            "raqamingiz va pasportingiz suratini yig‘ish hamda shifrlangan holda "
+            "saqlashga rozimisiz?"
+        ),
+        "consent_agree_button": "Roziman",
+        "consent_decline_button": "Rad etaman",
+        "consent_declined": (
+            "Ro‘yxatdan o‘tish bekor qilindi. Rozilik berilmagani uchun telefon, "
+            "pasport va surat so‘ralmadi."
+        ),
+        "consent_save_failed": (
+            "Rozilikni saqlab bo‘lmadi. Iltimos, qayta urinib ko‘ring."
+        ),
+        "consent_choice_prompt": (
+            "Davom etish uchun rozilik tugmalaridan birini tanlang."
+        ),
         "menu_prompt": "Kerakli bo‘limni tanlang:",
         "register_button": "Ro‘yxatdan o‘tish",
         "settings_button": "Sozlamalar",
@@ -58,6 +75,22 @@ TEXTS: dict[Language, dict[str, str]] = {
         "privacy_notice": (
             "Для регистрации потребуется ваш номер телефона, номер паспорта и "
             "фотография паспорта. Данные шифруются перед сохранением."
+        ),
+        "consent_notice": (
+            "Вы согласны на сбор и хранение в зашифрованном виде номера телефона, "
+            "номера паспорта и фотографии паспорта для регистрации в AGLINK CARGO?"
+        ),
+        "consent_agree_button": "Согласен",
+        "consent_decline_button": "Отказываюсь",
+        "consent_declined": (
+            "Регистрация отменена. Без согласия телефон, паспорт и фотография "
+            "не запрашивались."
+        ),
+        "consent_save_failed": (
+            "Не удалось сохранить согласие. Попробуйте ещё раз."
+        ),
+        "consent_choice_prompt": (
+            "Чтобы продолжить, выберите один из вариантов согласия."
         ),
         "menu_prompt": "Выберите нужный раздел:",
         "register_button": "Регистрация",
