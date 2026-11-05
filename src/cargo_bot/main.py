@@ -11,6 +11,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
+from telegram.error import InvalidToken
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -668,4 +669,8 @@ def main() -> None:
         CommandHandler("customer_code_history", handle_admin_code_history)
     )
     application.add_error_handler(report_update_error)
-    application.run_polling()
+    try:
+        application.run_polling()
+    except InvalidToken:
+        logger.critical("Telegram API rejected the configured bot token.")
+        raise SystemExit(1) from None
