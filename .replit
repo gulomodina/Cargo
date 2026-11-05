@@ -46,4 +46,4 @@ packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "postgres
 [userenv]
 
 [userenv.shared]
-TELEGRAM_ADMIN_IDS = "9291355205"
+TELEGRAM_ADMIN_IDS = "9006775146"
