@@ -26,20 +26,21 @@ A Python Telegram bot foundation for cargo workflows, built incrementally as the
 ## Where things live
 
 - `src/cargo_bot/` — Telegram registration and admin commands, encryption, configuration, and database access
-- `lib/db/` — shared PostgreSQL schema for customer registrations and tracking-code audit records
+- `lib/db/` — shared PostgreSQL schema for customer registrations, tracking-code audits, and language preferences
 - `artifacts/api-server/` — shared Express API
 
 ## Architecture decisions
 
 - Telegram's official Bot API is called directly from Python; no Telegram Replit integration is configured.
 - Customer phone, passport number, passport photo, and Telegram ID are encrypted with AES-GCM before being stored in PostgreSQL; Telegram and phone lookup keys are HMAC-derived.
+- Customer language preferences are stored separately from registration records under an HMAC-derived user key; the bot supports Uzbek and Russian.
 - Tracking codes are allocated transactionally from `UZ10001`, protected by database uniqueness constraints, and every assignment or change is recorded in an audit table.
 - Admin search, code changes, and history are private-chat-only and require a Telegram user ID in `TELEGRAM_ADMIN_IDS`; code changes notify the customer after the database commit.
 - The bot uses the managed PostgreSQL connection as provided by Replit and does not override its connection-security settings.
 
 ## Product
 
-The bot supports private customer registration and admin-only customer tracking-code management. It collects the customer's own Telegram contact, validates the passport number format, accepts a JPEG/PNG passport image, and stores the submitted data encrypted in PostgreSQL. No other cargo features are included.
+The bot supports Uzbek and Russian customer menus, private customer registration, and admin-only customer tracking-code management. Customers can change their language in Settings. It collects the customer's own Telegram contact, validates the passport number format, accepts a JPEG/PNG passport image, and stores the submitted data encrypted in PostgreSQL. No other cargo features are included.
 
 ## User preferences
 

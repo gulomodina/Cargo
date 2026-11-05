@@ -55,3 +55,14 @@ export const customerTrackingCodeAuditTable = pgTable(
       .defaultNow(),
   },
 );
+
+export const customerLanguagePreferencesTable = pgTable(
+  "customer_language_preferences",
+  {
+    userKey: bytea("user_key").primaryKey(),
+    languageCode: varchar("language_code", { length: 2 }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+);

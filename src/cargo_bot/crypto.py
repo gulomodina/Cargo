@@ -42,6 +42,15 @@ def customer_phone_lookup_key(master_key: bytes, phone_number: str) -> bytes:
     ).digest()
 
 
+def customer_user_key(master_key: bytes, telegram_user_id: int) -> bytes:
+    lookup_key = _derive_key(master_key, b"customer-lookup-v1")
+    return hmac.new(
+        lookup_key,
+        str(telegram_user_id).encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+
+
 def encrypt_customer_registration(
     master_key: bytes,
     telegram_user_id: int,
@@ -51,12 +60,7 @@ def encrypt_customer_registration(
     photo_mime_type: str,
 ) -> tuple[bytes, bytes]:
     """Return a pseudonymous lookup key and an authenticated encrypted payload."""
-    lookup_key = _derive_key(master_key, b"customer-lookup-v1")
-    user_key = hmac.new(
-        lookup_key,
-        str(telegram_user_id).encode("ascii"),
-        hashlib.sha256,
-    ).digest()
+    user_key = customer_user_key(master_key, telegram_user_id)
 
     payload = json.dumps(
         {

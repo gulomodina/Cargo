@@ -19,12 +19,15 @@ from cargo_bot import admin, main
 from cargo_bot.config import Settings
 from cargo_bot.crypto import (
     customer_phone_lookup_key,
+    customer_user_key,
     decrypt_customer_registration,
     encrypt_customer_registration,
 )
 from cargo_bot.database import (
     find_customer_by_tracking_code,
+    get_customer_language,
     get_customer_tracking_code_history,
+    save_customer_language,
     save_customer_registration,
 )
 
@@ -124,6 +127,13 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
+            """
+            CREATE TABLE customer_language_preferences (
+                user_key BYTEA PRIMARY KEY,
+                language_code VARCHAR(2) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
         )
         async with await psycopg.AsyncConnection.connect(
             cls.test_database_url,
@@ -156,7 +166,8 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     """
-                    TRUNCATE TABLE customer_tracking_code_audit,
+                    TRUNCATE TABLE customer_language_preferences,
+                                   customer_tracking_code_audit,
                                    customer_registrations,
                                    customer_tracking_code_counters
                     RESTART IDENTITY CASCADE
@@ -175,7 +186,8 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     """
-                    TRUNCATE TABLE customer_tracking_code_audit,
+                    TRUNCATE TABLE customer_language_preferences,
+                                   customer_tracking_code_audit,
                                    customer_registrations,
                                    customer_tracking_code_counters
                     RESTART IDENTITY CASCADE
@@ -218,15 +230,53 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         )
         return user_key, tracking_code
 
+    async def _select_language(self, language: str) -> SimpleNamespace:
+        chat = SimpleNamespace(type=ChatType.PRIVATE)
+        start_message = SimpleNamespace(reply_text=AsyncMock())
+        start_update = SimpleNamespace(
+            effective_message=start_message,
+            effective_chat=chat,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+        )
+        await main.start(start_update, self.context, self.settings)
+
+        language_buttons = (
+            start_message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+        )
+        self.assertEqual(language_buttons[0][0].text, "🇺🇿 O‘zbek tili")
+        self.assertEqual(language_buttons[1][0].text, "🇷🇺 Русский язык")
+
+        menu_message = SimpleNamespace(reply_text=AsyncMock())
+        language_query = SimpleNamespace(
+            answer=AsyncMock(),
+            data=f"language:{language}",
+            message=menu_message,
+        )
+        language_update = SimpleNamespace(
+            callback_query=language_query,
+            effective_message=menu_message,
+            effective_chat=chat,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+        )
+        await main.select_language(language_update, self.context, self.settings)
+        self.assertEqual(self.context.user_data["language_code"], language)
+        self.assertEqual(
+            await get_customer_language(
+                self.settings.database_url,
+                customer_user_key(
+                    self.settings.customer_data_encryption_key,
+                    self.telegram_user_id,
+                ),
+            ),
+            language,
+        )
+        return menu_message
+
     async def test_registration_assigns_code_and_stores_encrypted_data(self) -> None:
         chat = SimpleNamespace(type=ChatType.PRIVATE)
-
-        start_message = SimpleNamespace(reply_text=AsyncMock())
-        start_update = SimpleNamespace(effective_message=start_message, effective_chat=chat)
-        state = await main.start(start_update, self.context)
-        self.assertEqual(state, ConversationHandler.END)
+        menu_message = await self._select_language("uz")
         registration_button = (
-            start_message.reply_text.await_args.kwargs["reply_markup"]
+            menu_message.reply_text.await_args.kwargs["reply_markup"]
             .inline_keyboard[0][0]
         )
         self.assertEqual(
@@ -237,6 +287,7 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         registration_message = SimpleNamespace(reply_text=AsyncMock())
         callback_query = SimpleNamespace(
             answer=AsyncMock(),
+            data="customer_registration:start",
             message=registration_message,
         )
         callback_update = SimpleNamespace(
@@ -245,6 +296,10 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         )
         state = await main.begin_registration(callback_update, self.context)
         self.assertEqual(state, main.WAITING_FOR_PHONE)
+        self.assertEqual(
+            registration_message.reply_text.await_args.args[0],
+            "Telefon raqamingizni quyidagi tugma orqali ulashing.",
+        )
         contact_button = (
             registration_message.reply_text.await_args.kwargs["reply_markup"]
             .keyboard[0][0]
@@ -279,6 +334,10 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         )
         state = await main.receive_phone(phone_update, self.context)
         self.assertEqual(state, main.WAITING_FOR_PASSPORT)
+        self.assertIn(
+            "Pasport seriyasi va raqamini kiriting",
+            phone_message.reply_text.await_args.args[0],
+        )
         self.assertEqual(
             self.context.user_data["customer_registration"]["phone_number"],
             FAKE_NORMALIZED_PHONE,
@@ -293,6 +352,10 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         )
         state = await main.receive_passport(invalid_passport_update, self.context)
         self.assertEqual(state, main.WAITING_FOR_PASSPORT)
+        self.assertIn(
+            "Format noto‘g‘ri",
+            invalid_passport_message.reply_text.await_args.args[0],
+        )
         self.assertNotIn(
             "passport_number",
             self.context.user_data["customer_registration"],
@@ -305,6 +368,10 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         passport_update = SimpleNamespace(effective_message=passport_message)
         state = await main.receive_passport(passport_update, self.context)
         self.assertEqual(state, main.WAITING_FOR_PHOTO)
+        self.assertIn(
+            "Pasportingizning",
+            passport_message.reply_text.await_args.args[0],
+        )
 
         remote_file = SimpleNamespace(
             download_as_bytearray=AsyncMock(return_value=bytearray(self.photo))
@@ -328,10 +395,10 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(state, ConversationHandler.END)
         success_message = photo_message.reply_text.await_args.args[0]
-        self.assertIn("registration is complete", success_message)
+        self.assertIn("Ro‘yxatdan o‘tish yakunlandi", success_message)
         self.assertIn("UZ10001", success_message)
         self.context.bot.get_file.assert_awaited_once()
-        self.assertEqual(self.context.user_data, {})
+        self.assertEqual(self.context.user_data, {"language_code": "uz"})
 
         user_key, encrypted_payload = await self._saved_payload()
         self.assertNotIn(FAKE_NORMALIZED_PHONE.encode(), encrypted_payload)
@@ -372,6 +439,83 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
             "UZ10001",
         )
         self.assertEqual(len(history), 1)
+        registration_payload_before_language_change = (
+            await self._saved_payload()
+        )[1]
+
+        settings_message = SimpleNamespace(reply_text=AsyncMock())
+        settings_open_update = SimpleNamespace(
+            callback_query=SimpleNamespace(
+                answer=AsyncMock(),
+                data="settings:open",
+                message=settings_message,
+            ),
+            effective_message=settings_message,
+            effective_chat=chat,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+        )
+        await main.handle_settings_action(
+            settings_open_update,
+            self.context,
+            self.settings,
+        )
+        self.assertIn("Sozlamalar", settings_message.reply_text.await_args.args[0])
+        change_language_button = (
+            settings_message.reply_text.await_args.kwargs["reply_markup"]
+            .inline_keyboard[0][0]
+        )
+        self.assertEqual(change_language_button.text, "Tilni o‘zgartirish")
+
+        language_settings_message = SimpleNamespace(reply_text=AsyncMock())
+        language_settings_update = SimpleNamespace(
+            callback_query=SimpleNamespace(
+                answer=AsyncMock(),
+                data="settings:language",
+                message=language_settings_message,
+            ),
+            effective_message=language_settings_message,
+            effective_chat=chat,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+        )
+        await main.handle_settings_action(
+            language_settings_update,
+            self.context,
+            self.settings,
+        )
+        language_menu = (
+            language_settings_message.reply_text.await_args.kwargs["reply_markup"]
+            .inline_keyboard
+        )
+        self.assertEqual(language_menu[0][0].text, "🇺🇿 O‘zbek tili")
+        self.assertEqual(language_menu[1][0].text, "🇷🇺 Русский язык")
+
+        russian_message = SimpleNamespace(reply_text=AsyncMock())
+        russian_update = SimpleNamespace(
+            callback_query=SimpleNamespace(
+                answer=AsyncMock(),
+                data="language:ru",
+                message=russian_message,
+            ),
+            effective_message=russian_message,
+            effective_chat=chat,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+        )
+        await main.select_language(russian_update, self.context, self.settings)
+        self.assertIn("Для регистрации потребуется", russian_message.reply_text.await_args.args[0])
+        self.assertEqual(
+            await get_customer_language(
+                self.settings.database_url,
+                customer_user_key(
+                    self.settings.customer_data_encryption_key,
+                    self.telegram_user_id,
+                ),
+            ),
+            "ru",
+        )
+        self.assertEqual(
+            (await self._saved_payload())[1],
+            registration_payload_before_language_change,
+        )
         self.assertIsNone(history[0].old_tracking_code)
         self.assertEqual(history[0].actor_type, "registration")
 
@@ -399,13 +543,146 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(row)
         return bytes(row[0]), bytes(row[1])
 
+    async def test_russian_registration_steps_and_confirmation(self) -> None:
+        chat = SimpleNamespace(type=ChatType.PRIVATE)
+        menu_message = await self._select_language("ru")
+        self.assertIn(
+            "Для регистрации потребуется",
+            menu_message.reply_text.await_args.args[0],
+        )
+
+        fresh_context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+        persisted_start_message = SimpleNamespace(reply_text=AsyncMock())
+        await main.start(
+            SimpleNamespace(
+                effective_message=persisted_start_message,
+                effective_chat=chat,
+                effective_user=SimpleNamespace(id=self.telegram_user_id),
+            ),
+            fresh_context,
+            self.settings,
+        )
+        self.assertEqual(
+            persisted_start_message.reply_text.await_args.args[0],
+            "Выберите язык:",
+        )
+        self.assertEqual(fresh_context.user_data["language_code"], "ru")
+
+        register_button = (
+            menu_message.reply_text.await_args.kwargs["reply_markup"]
+            .inline_keyboard[0][0]
+        )
+        self.assertEqual(register_button.text, "Регистрация")
+
+        registration_message = SimpleNamespace(reply_text=AsyncMock())
+        callback_update = SimpleNamespace(
+            callback_query=SimpleNamespace(
+                answer=AsyncMock(),
+                data="customer_registration:start",
+                message=registration_message,
+            ),
+            effective_chat=chat,
+        )
+        state = await main.begin_registration(callback_update, self.context)
+        self.assertEqual(state, main.WAITING_FOR_PHONE)
+        self.assertIn(
+            "Поделитесь своим номером",
+            registration_message.reply_text.await_args.args[0],
+        )
+        self.assertEqual(
+            registration_message.reply_text.await_args.kwargs["reply_markup"]
+            .keyboard[0][0]
+            .text,
+            "Поделиться моим номером",
+        )
+
+        phone_message = SimpleNamespace(
+            contact=SimpleNamespace(
+                user_id=self.telegram_user_id,
+                phone_number=FAKE_PHONE_NUMBER,
+            ),
+            reply_text=AsyncMock(),
+        )
+        phone_update = SimpleNamespace(
+            effective_message=phone_message,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+        )
+        state = await main.receive_phone(phone_update, self.context)
+        self.assertEqual(state, main.WAITING_FOR_PASSPORT)
+        self.assertIn(
+            "Введите серию и номер паспорта",
+            phone_message.reply_text.await_args.args[0],
+        )
+
+        invalid_passport_message = SimpleNamespace(
+            text="AB123",
+            reply_text=AsyncMock(),
+        )
+        state = await main.receive_passport(
+            SimpleNamespace(effective_message=invalid_passport_message),
+            self.context,
+        )
+        self.assertEqual(state, main.WAITING_FOR_PASSPORT)
+        self.assertIn(
+            "Неверный формат",
+            invalid_passport_message.reply_text.await_args.args[0],
+        )
+
+        passport_message = SimpleNamespace(
+            text=FAKE_PASSPORT_NUMBER,
+            reply_text=AsyncMock(),
+        )
+        state = await main.receive_passport(
+            SimpleNamespace(effective_message=passport_message),
+            self.context,
+        )
+        self.assertEqual(state, main.WAITING_FOR_PHOTO)
+        self.assertIn(
+            "Загрузите чёткую фотографию",
+            passport_message.reply_text.await_args.args[0],
+        )
+
+        remote_file = SimpleNamespace(
+            download_as_bytearray=AsyncMock(return_value=bytearray(self.photo))
+        )
+        self.context.bot.get_file = AsyncMock(return_value=remote_file)
+        photo_message = SimpleNamespace(
+            photo=[
+                SimpleNamespace(
+                    file_id="synthetic-russian-test-photo",
+                    file_size=len(self.photo),
+                )
+            ],
+            document=None,
+            reply_text=AsyncMock(),
+        )
+        state = await main.receive_photo(
+            SimpleNamespace(
+                effective_message=photo_message,
+                effective_user=SimpleNamespace(id=self.telegram_user_id),
+            ),
+            self.context,
+            self.settings,
+        )
+        self.assertEqual(state, ConversationHandler.END)
+        self.assertIn(
+            "Регистрация завершена",
+            photo_message.reply_text.await_args.args[0],
+        )
+        self.assertIn("UZ10001", photo_message.reply_text.await_args.args[0])
+
     async def test_admin_search_change_history_and_duplicate_protection(self) -> None:
         first_customer_id = self._fake_telegram_id()
         second_customer_id = self._fake_telegram_id()
         _, first_code = await self._save_fake_customer(first_customer_id)
-        _, second_code = await self._save_fake_customer(
+        second_user_key, second_code = await self._save_fake_customer(
             second_customer_id,
             phone_number="+15555550124",
+        )
+        await save_customer_language(
+            self.settings.database_url,
+            second_user_key,
+            "ru",
         )
         self.assertEqual(first_code, "UZ10001")
         self.assertEqual(second_code, "UZ10002")
@@ -499,6 +776,10 @@ class CustomerRegistrationAndTrackingTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(
             "UZ60000",
+            notification_bot.send_message.await_args.kwargs["text"],
+        )
+        self.assertIn(
+            "Ваш новый код отслеживания",
             notification_bot.send_message.await_args.kwargs["text"],
         )
         self.assertNotIn(

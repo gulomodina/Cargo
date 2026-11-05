@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 from .config import Settings
 from .crypto import (
     customer_phone_lookup_key,
+    customer_user_key,
     decrypt_customer_registration,
     normalize_phone_number,
 )
@@ -15,8 +16,10 @@ from .database import (
     change_customer_tracking_code,
     find_customer_by_tracking_code,
     find_customers_by_phone_lookup_key,
+    get_customer_language,
     get_customer_tracking_code_history,
 )
+from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, text as localized_text
 
 logger = logging.getLogger(__name__)
 TRACKING_CODE_PATTERN = re.compile(r"UZ[0-9]{5,19}", re.ASCII)
@@ -181,10 +184,32 @@ async def change_tracking_code(
         await message.reply_text("The customer already has that tracking code.")
         return
 
+    customer_language = DEFAULT_LANGUAGE
+    if customer_telegram_id is not None:
+        try:
+            stored_language = await get_customer_language(
+                settings.database_url,
+                customer_user_key(
+                    settings.customer_data_encryption_key,
+                    customer_telegram_id,
+                ),
+            )
+            if stored_language in SUPPORTED_LANGUAGES:
+                customer_language = stored_language
+        except Exception as error:
+            logger.error(
+                "Customer notification language lookup failed (%s).",
+                type(error).__name__,
+            )
+
     try:
         await context.bot.send_message(
             chat_id=customer_telegram_id,
-            text=f"Your customer tracking code has changed to {new_code}.",
+            text=localized_text(
+                customer_language,
+                "tracking_code_changed",
+                tracking_code=new_code,
+            ),
         )
     except Exception as error:
         logger.error(

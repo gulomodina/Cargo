@@ -25,16 +25,127 @@ from .admin import change_tracking_code, search_customers, show_tracking_code_hi
 from .config import Settings
 from .crypto import (
     customer_phone_lookup_key,
+    customer_user_key,
     encrypt_customer_registration,
     normalize_phone_number,
 )
-from .database import save_customer_registration, verify_database_connection
+from .database import (
+    get_customer_language,
+    save_customer_language,
+    save_customer_registration,
+    verify_database_connection,
+)
+from .i18n import (
+    DEFAULT_LANGUAGE,
+    INITIAL_LANGUAGE_PROMPT,
+    LANGUAGE_BUTTONS,
+    SUPPORTED_LANGUAGES,
+    text as localized_text,
+)
 
 logger = logging.getLogger(__name__)
 
 WAITING_FOR_PHONE, WAITING_FOR_PASSPORT, WAITING_FOR_PHOTO = range(3)
 MAX_PASSPORT_PHOTO_BYTES = 5 * 1024 * 1024
 PASSPORT_PATTERN = re.compile(r"[A-Za-z]{2}[0-9]{7}", re.ASCII)
+LANGUAGE_CALLBACK_PATTERN = re.compile(r"^language:(uz|ru)$", re.ASCII)
+SETTINGS_CALLBACK_PATTERN = re.compile(r"^settings:(open|language|menu)$", re.ASCII)
+
+
+def get_context_language(context: ContextTypes.DEFAULT_TYPE) -> str:
+    language = context.user_data.get("language_code", DEFAULT_LANGUAGE)
+    return language if language in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+
+async def get_user_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+) -> str:
+    current = context.user_data.get("language_code")
+    if current in SUPPORTED_LANGUAGES:
+        return current
+
+    user = update.effective_user
+    if user is not None:
+        user_key = customer_user_key(
+            settings.customer_data_encryption_key,
+            user.id,
+        )
+        try:
+            language = await get_customer_language(settings.database_url, user_key)
+        except Exception as error:
+            logger.error("Customer language lookup failed (%s).", type(error).__name__)
+            language = None
+        if language in SUPPORTED_LANGUAGES:
+            context.user_data["language_code"] = language
+            return language
+
+    context.user_data["language_code"] = DEFAULT_LANGUAGE
+    return DEFAULT_LANGUAGE
+
+
+def language_selection_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    LANGUAGE_BUTTONS["uz"],
+                    callback_data="language:uz",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    LANGUAGE_BUTTONS["ru"],
+                    callback_data="language:ru",
+                )
+            ],
+        ]
+    )
+
+
+def customer_menu_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    localized_text(language, "register_button"),
+                    callback_data="customer_registration:start",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    localized_text(language, "settings_button"),
+                    callback_data="settings:open",
+                )
+            ],
+        ]
+    )
+
+
+def settings_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    localized_text(language, "change_language_button"),
+                    callback_data="settings:language",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    localized_text(language, "back_to_menu_button"),
+                    callback_data="settings:menu",
+                )
+            ],
+        ]
+    )
+
+
+def clear_registration_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    language = get_context_language(context)
+    context.user_data.clear()
+    context.user_data["language_code"] = language
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -60,6 +171,7 @@ class SecretRedactionFilter(logging.Filter):
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
 ) -> int:
     message = update.effective_message
     chat = update.effective_chat
@@ -68,19 +180,127 @@ async def start(
     if message is None or chat is None:
         return ConversationHandler.END
 
+    stored_language: str | None = None
+    user = update.effective_user
+    if user is not None:
+        user_key = customer_user_key(
+            settings.customer_data_encryption_key,
+            user.id,
+        )
+        try:
+            stored_language = await get_customer_language(
+                settings.database_url,
+                user_key,
+            )
+        except Exception as error:
+            logger.error("Customer language lookup failed (%s).", type(error).__name__)
+    language = (
+        stored_language
+        if stored_language in SUPPORTED_LANGUAGES
+        else DEFAULT_LANGUAGE
+    )
+    context.user_data["language_code"] = language
     if chat.type != ChatType.PRIVATE:
         await message.reply_text(
-            "For privacy, customer registration must be completed in a private chat."
+            localized_text(language, "private_only")
         )
         return ConversationHandler.END
 
     await message.reply_text(
-        "Register as a customer to share your phone number, passport number, and "
-        "passport photo. These details are encrypted before storage.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Register", callback_data="customer_registration:start")]]
-        ),
+        localized_text(language, "language_prompt")
+        if stored_language in SUPPORTED_LANGUAGES
+        else INITIAL_LANGUAGE_PROMPT,
+        reply_markup=language_selection_keyboard(),
     )
+    return ConversationHandler.END
+
+
+async def select_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+) -> int:
+    query = update.callback_query
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if query is None or message is None or chat is None or user is None:
+        return ConversationHandler.END
+
+    await query.answer()
+    if chat.type != ChatType.PRIVATE:
+        await message.reply_text(localized_text(DEFAULT_LANGUAGE, "private_only"))
+        return ConversationHandler.END
+
+    match = LANGUAGE_CALLBACK_PATTERN.fullmatch(query.data or "")
+    if match is None:
+        return ConversationHandler.END
+    language = match.group(1)
+    context.user_data["language_code"] = language
+    user_key = customer_user_key(
+        settings.customer_data_encryption_key,
+        user.id,
+    )
+    try:
+        await save_customer_language(
+            settings.database_url,
+            user_key,
+            language,
+        )
+    except Exception as error:
+        logger.error("Customer language save failed (%s).", type(error).__name__)
+        await message.reply_text(
+            localized_text(language, "language_save_failed"),
+            reply_markup=language_selection_keyboard(),
+        )
+        return ConversationHandler.END
+
+    await message.reply_text(
+        f"{localized_text(language, 'privacy_notice')}\n\n"
+        f"{localized_text(language, 'menu_prompt')}",
+        reply_markup=customer_menu_keyboard(language),
+    )
+    return ConversationHandler.END
+
+
+async def handle_settings_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+) -> int:
+    query = update.callback_query
+    message = update.effective_message
+    chat = update.effective_chat
+    if query is None or message is None or chat is None:
+        return ConversationHandler.END
+
+    await query.answer()
+    language = await get_user_language(update, context, settings)
+    if chat.type != ChatType.PRIVATE:
+        await message.reply_text(localized_text(language, "private_only"))
+        return ConversationHandler.END
+
+    callback_data = query.data or ""
+    if SETTINGS_CALLBACK_PATTERN.fullmatch(callback_data) is None:
+        return ConversationHandler.END
+
+    if callback_data == "settings:language":
+        await message.reply_text(
+            localized_text(language, "language_prompt"),
+            reply_markup=language_selection_keyboard(),
+        )
+    elif callback_data == "settings:menu":
+        await message.reply_text(
+            f"{localized_text(language, 'privacy_notice')}\n\n"
+            f"{localized_text(language, 'menu_prompt')}",
+            reply_markup=customer_menu_keyboard(language),
+        )
+    else:
+        await message.reply_text(
+            f"{localized_text(language, 'settings_title')}\n"
+            f"{localized_text(language, 'language_label')}",
+            reply_markup=settings_keyboard(language),
+        )
     return ConversationHandler.END
 
 
@@ -97,11 +317,17 @@ async def begin_registration(
     if chat.type != ChatType.PRIVATE or query.message is None:
         return ConversationHandler.END
 
-    context.user_data.clear()
+    language = get_context_language(context)
+    clear_registration_data(context)
     await query.message.reply_text(
-        "Share your own phone number using the button below.",
+        localized_text(language, "phone_request"),
         reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("Share my phone number", request_contact=True)]],
+            [[
+                KeyboardButton(
+                    localized_text(language, "share_phone_button"),
+                    request_contact=True,
+                )
+            ]],
             resize_keyboard=True,
             one_time_keyboard=True,
         ),
@@ -111,12 +337,12 @@ async def begin_registration(
 
 async def prompt_for_phone(
     update: Update,
-    _context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
     message = update.effective_message
     if message is not None:
         await message.reply_text(
-            "Please use the button to share your own phone number."
+            localized_text(get_context_language(context), "phone_own_only")
         )
     return WAITING_FOR_PHONE
 
@@ -133,7 +359,7 @@ async def receive_phone(
 
     if contact.user_id != user.id or not contact.phone_number.strip():
         await message.reply_text(
-            "Please share your own phone number using the button."
+            localized_text(get_context_language(context), "phone_own_only")
         )
         return WAITING_FOR_PHONE
 
@@ -141,13 +367,13 @@ async def receive_phone(
         phone_number = normalize_phone_number(contact.phone_number)
     except ValueError:
         await message.reply_text(
-            "That phone number is invalid. Please share your number using the button."
+            localized_text(get_context_language(context), "phone_invalid")
         )
         return WAITING_FOR_PHONE
 
     context.user_data["customer_registration"] = {"phone_number": phone_number}
     await message.reply_text(
-        "Enter your passport series and number, for example AB1234567.",
+        localized_text(get_context_language(context), "passport_request"),
         reply_markup=ReplyKeyboardRemove(),
     )
     return WAITING_FOR_PASSPORT
@@ -155,12 +381,12 @@ async def receive_phone(
 
 async def prompt_for_passport(
     update: Update,
-    _context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
     message = update.effective_message
     if message is not None:
         await message.reply_text(
-            "Enter two letters followed by seven digits, for example AB1234567."
+            localized_text(get_context_language(context), "passport_prompt")
         )
     return WAITING_FOR_PASSPORT
 
@@ -175,34 +401,34 @@ async def receive_passport(
 
     if registration is None:
         if message is not None:
-            await message.reply_text("Registration expired. Send /start to begin again.")
+            await message.reply_text(
+                localized_text(get_context_language(context), "registration_expired")
+            )
         return ConversationHandler.END
 
     if PASSPORT_PATTERN.fullmatch(passport_number) is None:
         if message is not None:
             await message.reply_text(
-                "That format is invalid. Enter two letters followed by seven digits, "
-                "for example AB1234567."
+                localized_text(get_context_language(context), "passport_invalid")
             )
         return WAITING_FOR_PASSPORT
 
     registration["passport_number"] = passport_number.upper()
     if message is not None:
         await message.reply_text(
-            "Upload a clear photo of your passport's identity page as a photo or "
-            "JPEG/PNG image."
+            localized_text(get_context_language(context), "photo_request")
         )
     return WAITING_FOR_PHOTO
 
 
 async def prompt_for_photo(
     update: Update,
-    _context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
     message = update.effective_message
     if message is not None:
         await message.reply_text(
-            "Please upload the passport identity page as a photo or JPEG/PNG image."
+            localized_text(get_context_language(context), "photo_prompt")
         )
     return WAITING_FOR_PHOTO
 
@@ -225,7 +451,9 @@ async def receive_photo(
     registration = context.user_data.get("customer_registration")
     if message is None or user is None or registration is None:
         if message is not None:
-            await message.reply_text("Registration expired. Send /start to begin again.")
+            await message.reply_text(
+                localized_text(get_context_language(context), "registration_expired")
+            )
         return ConversationHandler.END
 
     if message.photo:
@@ -237,24 +465,28 @@ async def receive_photo(
         media = message.document
     else:
         await message.reply_text(
-            "Please upload a JPEG or PNG photo of the passport identity page."
+            localized_text(get_context_language(context), "photo_prompt")
         )
         return WAITING_FOR_PHOTO
 
     if media.file_size is not None and media.file_size > MAX_PASSPORT_PHOTO_BYTES:
-        await message.reply_text("The image must be 5 MB or smaller. Please upload it again.")
+        await message.reply_text(
+            localized_text(get_context_language(context), "photo_too_large")
+        )
         return WAITING_FOR_PHOTO
 
     remote_file = await context.bot.get_file(media.file_id)
     image = bytes(await remote_file.download_as_bytearray())
     if len(image) > MAX_PASSPORT_PHOTO_BYTES:
-        await message.reply_text("The image must be 5 MB or smaller. Please upload it again.")
+        await message.reply_text(
+            localized_text(get_context_language(context), "photo_too_large")
+        )
         return WAITING_FOR_PHOTO
 
     mime_type = detect_image_type(image)
     if mime_type is None:
         await message.reply_text(
-            "That file is not a supported JPEG or PNG image. Please upload it again."
+            localized_text(get_context_language(context), "photo_invalid")
         )
         return WAITING_FOR_PHOTO
 
@@ -279,18 +511,22 @@ async def receive_photo(
         )
     except Exception as error:
         logger.error("Customer registration failed (%s).", type(error).__name__)
-        context.user_data.clear()
+        clear_registration_data(context)
         await message.reply_text(
-            "We couldn't save your registration. Please send /start to try again.",
+            localized_text(get_context_language(context), "registration_failed"),
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
 
-    context.user_data.clear()
+    language = get_context_language(context)
+    clear_registration_data(context)
     await message.reply_text(
-        f"Your customer registration is complete. Your tracking code is "
-        f"{tracking_code}. Your information was saved encrypted.",
-        reply_markup=ReplyKeyboardRemove(),
+        localized_text(
+            language,
+            "registration_complete",
+            tracking_code=tracking_code,
+        ),
+        reply_markup=customer_menu_keyboard(language),
     )
     return ConversationHandler.END
 
@@ -328,6 +564,24 @@ def main() -> None:
         await verify_database_connection(settings.database_url)
         logger.info("Telegram bot startup checks passed.")
 
+    async def handle_start(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        return await start(update, context, settings)
+
+    async def handle_language_selection(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        return await select_language(update, context, settings)
+
+    async def handle_settings_callback(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        return await handle_settings_action(update, context, settings)
+
     async def handle_photo_update(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
@@ -360,10 +614,18 @@ def main() -> None:
     )
     registration_conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
+            CommandHandler("start", handle_start),
+            CallbackQueryHandler(
+                handle_language_selection,
+                pattern=LANGUAGE_CALLBACK_PATTERN,
+            ),
             CallbackQueryHandler(
                 begin_registration,
                 pattern=r"^customer_registration:start$",
+            ),
+            CallbackQueryHandler(
+                handle_settings_callback,
+                pattern=SETTINGS_CALLBACK_PATTERN,
             ),
         ],
         states={

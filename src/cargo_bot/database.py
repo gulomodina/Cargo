@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import psycopg
 
 from .crypto import decrypt_customer_registration
+from .i18n import SUPPORTED_LANGUAGES
 
 logger = logging.getLogger(__name__)
 TRACKING_CODE_PATTERN = re.compile(r"UZ[0-9]{5,19}", re.ASCII)
@@ -25,6 +26,67 @@ class TrackingCodeAuditEntry:
     changed_by_telegram_id: int | None
     actor_type: str
     created_at: object
+
+
+async def get_customer_language(
+    database_url: str,
+    user_key: bytes,
+) -> str | None:
+    try:
+        async with await psycopg.AsyncConnection.connect(
+            database_url,
+            connect_timeout=5,
+        ) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT language_code
+                    FROM customer_language_preferences
+                    WHERE user_key = %s
+                    """,
+                    (user_key,),
+                )
+                row = await cursor.fetchone()
+                if row is None or row[0] not in SUPPORTED_LANGUAGES:
+                    return None
+                return row[0]
+    except psycopg.Error as error:
+        error_type = type(error).__name__
+        logger.error("Customer language lookup failed (%s).", error_type)
+        raise RuntimeError(
+            f"Customer language lookup failed ({error_type})."
+        ) from None
+
+
+async def save_customer_language(
+    database_url: str,
+    user_key: bytes,
+    language_code: str,
+) -> None:
+    if language_code not in SUPPORTED_LANGUAGES:
+        raise ValueError("Unsupported customer language.")
+    try:
+        async with await psycopg.AsyncConnection.connect(
+            database_url,
+            connect_timeout=5,
+        ) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO customer_language_preferences (user_key, language_code)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_key) DO UPDATE
+                    SET language_code = EXCLUDED.language_code,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (user_key, language_code),
+                )
+    except psycopg.Error as error:
+        error_type = type(error).__name__
+        logger.error("Customer language save failed (%s).", error_type)
+        raise RuntimeError(
+            f"Customer language save failed ({error_type})."
+        ) from None
 
 
 async def _next_tracking_code(cursor: psycopg.AsyncCursor) -> str:
